@@ -1,0 +1,13 @@
+{
+  "_instructions": "Add your positions here. bought_price is what you paid. quantity is how many you hold. bought_at is ISO timestamp.",
+  "positions": [
+    {
+    "item":         "enchanted golden apple",
+    "quantity":     156,
+    "bought_price": 640000,
+    "bought_at":    "2026-02-18",
+    "note":         "bought a lot of these when they were cheap, hoping for a price increase"
+    }
+
+  ]
+}

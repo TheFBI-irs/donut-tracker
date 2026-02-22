@@ -1,0 +1,16 @@
+{
+  "items": [
+    "elytra",
+    "netherite_ingot",
+    "netherite_block",
+    "dragon_head",
+    "enchanted_golden_apple"
+  ],
+  "fair_values": {
+    "elytra":                  280000000,
+    "netherite_ingot":           4300000,
+    "netherite_block":          38000000,
+    "dragon_head":              26000000,
+    "enchanted_golden_apple":     620000
+  }
+}
