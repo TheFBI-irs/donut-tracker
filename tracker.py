@@ -1,14 +1,15 @@
 """
 tracker.py — Watch-list alerts with fully self-calibrating signals.
 
-Both demand (gap%) and depth are calibrated using z-scores against
-each item's own rolling history. No hardcoded thresholds anywhere.
-The system learns what "normal" looks like per item and signals
-deviations from that baseline — including after regime resets.
+Calibration history is loaded directly from PostgreSQL on startup,
+so it survives Railway redeployments. price_history.json is no longer
+used — the database IS the source of truth.
+
+On startup, the last CALIBRATION_WINDOW snapshots per watch-list item
+are loaded from the snapshots table into memory. From there the scan
+loop appends new records as before. No data is ever lost on redeploy.
 """
 
-import json
-import os
 import logging
 from datetime import datetime
 
@@ -16,36 +17,61 @@ logger = logging.getLogger(__name__)
 
 TOP_N_BIDS           = 10
 MIN_BID_FLOOR        = 1000
-DEPTH_FLOOR          = 0.90    # bids within 10% of BBP count as "serious"
-HISTORY_FILE         = "price_history.json"
-MAX_HISTORY          = 96      # keep up to 48 hours of raw samples
-CALIBRATION_WINDOW   = 48      # only use last 48 scans for baselines
-CALIBRATION_MIN      = 10      # scans needed before labels mean anything
+DEPTH_FLOOR          = 0.90
+MAX_HISTORY          = 96
+CALIBRATION_WINDOW   = 48
+CALIBRATION_MIN      = 10
 VOLATILITY_THRESHOLD = 0.05
 
+# In-memory rolling window — populated from PostgreSQL on startup
+# Structure: { item_id: [ {ts, bbp, gap_pct, depth, top_bids}, ... ] }
+price_history: dict = {}
+
 # ---------------------------------------------------------------------------
-# Persistent history
+# Load calibration history from PostgreSQL
 # ---------------------------------------------------------------------------
 
-def load_history() -> dict:
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                data = json.load(f)
-                logger.info(f"Loaded price history ({HISTORY_FILE})")
-                return data
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not load history: {e}. Starting fresh.")
-    return {}
+def load_history_from_db(watch_items: list):
+    """
+    Called once at startup. Populates price_history from the last
+    CALIBRATION_WINDOW snapshots per item in PostgreSQL.
+    This means calibration survives redeployments completely.
+    """
+    global price_history
+    from historian import execute_query
 
-def save_history(history: dict):
-    try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
-    except OSError as e:
-        logger.error(f"Failed to save price history: {e}")
+    logger.info("Loading calibration history from PostgreSQL...")
+    loaded = 0
 
-price_history: dict = load_history()
+    for item in watch_items:
+        rows = execute_query("""
+            SELECT s.ts, sn.bbp, sn.gap_pct, sn.depth, sn.top_bid,
+                   sn.second_bid, sn.third_bid
+            FROM snapshots sn
+            JOIN scans s ON s.id = sn.scan_id
+            WHERE sn.item_id = %s
+              AND sn.bbp IS NOT NULL
+            ORDER BY sn.scan_id DESC
+            LIMIT %s
+        """, (item, CALIBRATION_WINDOW))
+
+        # Reverse so oldest is first (same order as append logic)
+        records = []
+        for r in reversed(rows):
+            top_bids = [b for b in [r["top_bid"], r["second_bid"], r["third_bid"]] if b]
+            records.append({
+                "ts":       r["ts"],
+                "bbp":      r["bbp"],
+                "gap_pct":  r["gap_pct"],
+                "depth":    r["depth"],
+                "top_bids": top_bids,
+            })
+
+        price_history[item] = records
+        loaded += len(records)
+        logger.info(f"  {item}: {len(records)} scans loaded")
+
+    logger.info(f"Calibration ready — {loaded} total records loaded from DB.")
 
 
 def reset_calibration(reason: str):
@@ -59,10 +85,9 @@ def reset_calibration(reason: str):
         if isinstance(price_history[item], list):
             price_history[item] = []
     price_history["_regime_reset"] = {
-        "ts": datetime.utcnow().isoformat(),
+        "ts":     datetime.utcnow().isoformat(),
         "reason": reason
     }
-    save_history(price_history)
 
 # ---------------------------------------------------------------------------
 # Core metrics
@@ -83,13 +108,12 @@ def compute_gap_pct(top_bids: list) -> float | None:
     return (sum(gaps) / len(gaps)) / top_bids[0]
 
 def compute_depth(all_real_bids: list, bbp: float) -> int:
-    """Count bids within 10% of BBP — serious buyers who would fill fast."""
     if not bbp:
         return 0
     return sum(1 for b in all_real_bids if b >= bbp * DEPTH_FLOOR)
 
 # ---------------------------------------------------------------------------
-# Z-score helper — shared by both calibrating labels
+# Z-score helper
 # ---------------------------------------------------------------------------
 
 def _zscore(value: float, window: list) -> float:
@@ -216,13 +240,9 @@ def detect_crash_risk(item: str, bbp: float, gap_pct: float, depth: int) -> str 
     avg_price = sum(recent_prices) / len(recent_prices)
     avg_gap   = sum(recent_gaps)   / len(recent_gaps)
 
-    price_falling   = bbp     < avg_price * 0.95
-    demand_thinning = gap_pct > avg_gap   * 1.5
-
-    if not (price_falling and demand_thinning):
+    if not (bbp < avg_price * 0.95 and gap_pct > avg_gap * 1.5):
         return None
 
-    # Severity: is depth also below its own baseline?
     depth_window = [r["depth"] for r in records[-CALIBRATION_WINDOW:]
                     if r.get("depth") is not None]
     avg_depth    = sum(depth_window) / len(depth_window) if depth_window else depth
@@ -242,7 +262,7 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
     alerts = []
 
     reset_info = price_history.get("_regime_reset")
-    if reset_info:
+    if reset_info and isinstance(reset_info, dict):
         alerts.append(
             f"⚡ REGIME RESET active since {reset_info['ts']} "
             f"({reset_info['reason'][:60]}...) — recalibrating."
@@ -282,7 +302,8 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
             f"Demand: {demand_lbl} | Depth: {depth_lbl}"
         )
 
-        # Persist BEFORE detectors so current sample is visible to them
+        # Persist to in-memory window (PostgreSQL already has the record
+        # from historian.record_scan — this is just for signal detection)
         records = price_history.setdefault(item, [])
         if not isinstance(records, list):
             records = []
@@ -318,8 +339,6 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
                     f"🔴 BBP ABOVE FAIR: **{item}** at {ratio:.0%} of fair "
                     f"({int(bbp):,} vs {fair:,})"
                 )
-
-    save_history(price_history)
 
     if not alerts:
         alerts.append("✅ Market scan complete — no signals detected.")

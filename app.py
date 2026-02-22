@@ -1,18 +1,20 @@
 """
 app.py — Main loop + Discord bot thread.
 
-Two things run simultaneously:
-  1. Background Discord bot (bot.py) — handles on-demand !commands
-  2. Main scan loop — runs every 30 minutes, pushes alerts via webhook
+Startup sequence:
+  1. init_db()                  — create PostgreSQL tables if needed
+  2. load_history_from_db()     — populate calibration from existing data
+  3. start_bot_thread()         — interactive Discord bot
+  4. scan loop                  — runs every 30 minutes forever
 """
 
 import time
 import logging
 from datetime import datetime, timezone
 
-from config import DISCORD_WEBHOOK, CHECK_INTERVAL, load_watchlist
+from config import CHECK_INTERVAL, load_watchlist
 from fetcher import fetch_all_orders
-from tracker import analyze_market
+from tracker import analyze_market, load_history_from_db
 from macro import analyze_macro
 from historian import init_db, record_scan
 from positions import report_positions
@@ -82,11 +84,19 @@ def run_cycle():
 
 def main():
     logger.info("Donut Market Tracker Started")
+
+    # Step 1: ensure tables exist
     init_db()
 
-    # Start interactive Discord bot in background thread
+    # Step 2: load calibration history from PostgreSQL
+    # This means calibration survives redeployments — no more starting over
+    watch_items, _ = load_watchlist()
+    load_history_from_db(watch_items)
+
+    # Step 3: start interactive Discord bot in background thread
     start_bot_thread()
 
+    # Step 4: main scan loop
     while True:
         try:
             run_cycle()
