@@ -1,12 +1,10 @@
 """
-tracker.py — Watch-list alerts with rolling self-calibrating demand + depth.
+tracker.py — Watch-list alerts with fully self-calibrating signals.
 
-DEPTH:
-  How many serious bids exist within 10% of BBP.
-  Thin market (depth < 5)  = fragile, price can move fast on low volume.
-  Liquid market (depth > 20) = stable, needs large supply shock to move.
-  Depth is factored into crash risk — a thin market crashing is more
-  dangerous than a liquid one because there are few buyers to absorb supply.
+Both demand (gap%) and depth are calibrated using z-scores against
+each item's own rolling history. No hardcoded thresholds anywhere.
+The system learns what "normal" looks like per item and signals
+deviations from that baseline — including after regime resets.
 """
 
 import json
@@ -20,14 +18,14 @@ TOP_N_BIDS           = 10
 MIN_BID_FLOOR        = 1000
 DEPTH_FLOOR          = 0.90    # bids within 10% of BBP count as "serious"
 HISTORY_FILE         = "price_history.json"
-MAX_HISTORY          = 96
-CALIBRATION_WINDOW   = 48
-CALIBRATION_MIN      = 10
+MAX_HISTORY          = 96      # keep up to 48 hours of raw samples
+CALIBRATION_WINDOW   = 48      # only use last 48 scans for baselines
+CALIBRATION_MIN      = 10      # scans needed before labels mean anything
 VOLATILITY_THRESHOLD = 0.05
 
-THIN_MARKET_DEPTH    = 5       # below this = fragile market warning
-LIQUID_MARKET_DEPTH  = 20      # above this = healthy liquidity
-
+# ---------------------------------------------------------------------------
+# Persistent history
+# ---------------------------------------------------------------------------
 
 def load_history() -> dict:
     if os.path.exists(HISTORY_FILE):
@@ -51,6 +49,10 @@ price_history: dict = load_history()
 
 
 def reset_calibration(reason: str):
+    """
+    Called by macro.py on regime change.
+    Wipes rolling windows so the system recalibrates from new baseline.
+    """
     global price_history
     logger.warning(f"Calibration reset triggered: {reason}")
     for item in list(price_history.keys()):
@@ -81,22 +83,24 @@ def compute_gap_pct(top_bids: list) -> float | None:
     return (sum(gaps) / len(gaps)) / top_bids[0]
 
 def compute_depth(all_real_bids: list, bbp: float) -> int:
-    """Bids within 10% of BBP — serious buyers who would fill fast."""
+    """Count bids within 10% of BBP — serious buyers who would fill fast."""
     if not bbp:
         return 0
-    floor = bbp * DEPTH_FLOOR
-    return sum(1 for b in all_real_bids if b >= floor)
-
-def depth_label(depth: int) -> str:
-    if depth < THIN_MARKET_DEPTH:
-        return f"⚠️ THIN ({depth})"
-    elif depth >= LIQUID_MARKET_DEPTH:
-        return f"💧 LIQUID ({depth})"
-    else:
-        return f"({depth})"
+    return sum(1 for b in all_real_bids if b >= bbp * DEPTH_FLOOR)
 
 # ---------------------------------------------------------------------------
-# Self-calibrating demand label (rolling window, z-score)
+# Z-score helper — shared by both calibrating labels
+# ---------------------------------------------------------------------------
+
+def _zscore(value: float, window: list) -> float:
+    n   = len(window)
+    avg = sum(window) / n
+    var = sum((x - avg) ** 2 for x in window) / n
+    std = var ** 0.5
+    return (value - avg) / std if std > 0 else 0
+
+# ---------------------------------------------------------------------------
+# Self-calibrating demand label (gap%)
 # ---------------------------------------------------------------------------
 
 def describe_demand(item: str, gap_pct: float) -> str:
@@ -107,10 +111,8 @@ def describe_demand(item: str, gap_pct: float) -> str:
     if n < CALIBRATION_MIN:
         return f"📊 CALIBRATING ({n}/{CALIBRATION_MIN}, gap {gap_pct*100:.2f}%)"
 
-    avg      = sum(window) / n
-    variance = sum((g - avg) ** 2 for g in window) / n
-    std      = variance ** 0.5
-    z        = (gap_pct - avg) / std if std > 0 else 0
+    avg = sum(window) / n
+    z   = _zscore(gap_pct, window)
 
     if z < -1.5:
         return f"🔥 HIGH (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
@@ -120,13 +122,35 @@ def describe_demand(item: str, gap_pct: float) -> str:
         return f"🟡 MEDIUM (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
 
 # ---------------------------------------------------------------------------
+# Self-calibrating depth label
+# ---------------------------------------------------------------------------
+
+def describe_depth(item: str, depth: int) -> str:
+    records = price_history.get(item, [])
+    window  = [r["depth"] for r in records[-CALIBRATION_WINDOW:]
+               if r.get("depth") is not None]
+    n = len(window)
+    if n < CALIBRATION_MIN:
+        return f"📊 CALIBRATING ({depth})"
+
+    avg = sum(window) / n
+    z   = _zscore(depth, window)
+
+    if z > 1.5:
+        return f"💧 DEEP ({depth} vs baseline {avg:.0f})"
+    elif z < -1.5:
+        return f"⚠️ THIN ({depth} vs baseline {avg:.0f})"
+    else:
+        return f"({depth} vs baseline {avg:.0f})"
+
+# ---------------------------------------------------------------------------
 # Signal detectors
 # ---------------------------------------------------------------------------
 
 def detect_demand_shift(item: str) -> str | None:
     records = price_history.get(item, [])
-    gaps = [r["gap_pct"] for r in records[-CALIBRATION_WINDOW:]
-            if r.get("gap_pct") is not None]
+    gaps    = [r["gap_pct"] for r in records[-CALIBRATION_WINDOW:]
+               if r.get("gap_pct") is not None]
     if len(gaps) < 4:
         return None
     prev_avg = sum(gaps[-4:-1]) / 3
@@ -185,6 +209,7 @@ def detect_crash_risk(item: str, bbp: float, gap_pct: float, depth: int) -> str 
     recent        = records[-3:]
     recent_prices = [r["bbp"]     for r in recent if r.get("bbp")]
     recent_gaps   = [r["gap_pct"] for r in recent if r.get("gap_pct") is not None]
+
     if not recent_prices or not recent_gaps:
         return None
 
@@ -194,14 +219,20 @@ def detect_crash_risk(item: str, bbp: float, gap_pct: float, depth: int) -> str 
     price_falling   = bbp     < avg_price * 0.95
     demand_thinning = gap_pct > avg_gap   * 1.5
 
-    if price_falling and demand_thinning:
-        severity = "🚨🚨 CRITICAL" if depth < THIN_MARKET_DEPTH else "🚨 CRASH RISK"
-        return (
-            f"{severity}: **{item}** — BBP down {(1 - bbp/avg_price):.1%}, "
-            f"gaps widened {(gap_pct/avg_gap - 1):.0%}, "
-            f"depth {depth_label(depth)}. Buyers losing conviction."
-        )
-    return None
+    if not (price_falling and demand_thinning):
+        return None
+
+    # Severity: is depth also below its own baseline?
+    depth_window = [r["depth"] for r in records[-CALIBRATION_WINDOW:]
+                    if r.get("depth") is not None]
+    avg_depth    = sum(depth_window) / len(depth_window) if depth_window else depth
+    severity     = "🚨🚨 CRITICAL" if depth < avg_depth * 0.6 else "🚨 CRASH RISK"
+
+    return (
+        f"{severity}: **{item}** — BBP down {(1 - bbp/avg_price):.1%}, "
+        f"gaps widened {(gap_pct/avg_gap - 1):.0%}, "
+        f"depth {describe_depth(item, depth)}. Buyers losing conviction."
+    )
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -230,10 +261,10 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
     now = datetime.utcnow().isoformat()
 
     for item in watch_items:
-        bids      = item_bids.get(item, [])
-        all_real  = sorted([b for b in bids if b >= MIN_BID_FLOOR], reverse=True)
-        top_bids  = all_real[:TOP_N_BIDS]
-        bbp       = compute_bbp(top_bids)
+        bids     = item_bids.get(item, [])
+        all_real = sorted([b for b in bids if b >= MIN_BID_FLOOR], reverse=True)
+        top_bids = all_real[:TOP_N_BIDS]
+        bbp      = compute_bbp(top_bids)
 
         if bbp is None:
             alerts.append(f"❓ **{item}** — no meaningful bids this scan")
@@ -243,13 +274,15 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
         depth       = compute_depth(all_real, bbp)
         top_display = [f"{b:,}" for b in top_bids[:3]]
         demand_lbl  = describe_demand(item, gap_pct) if gap_pct is not None else "❓"
+        depth_lbl   = describe_depth(item, depth)
 
         alerts.append(
             f"📊 **{item}** | BBP: {int(bbp):,} | "
             f"Top 3: [{', '.join(top_display)}] | "
-            f"Demand: {demand_lbl} | Depth: {depth_label(depth)}"
+            f"Demand: {demand_lbl} | Depth: {depth_lbl}"
         )
 
+        # Persist BEFORE detectors so current sample is visible to them
         records = price_history.setdefault(item, [])
         if not isinstance(records, list):
             records = []
@@ -258,7 +291,7 @@ def analyze_market(orders: list, watch_items: list, fair_values: dict) -> list:
         records.append({
             "ts": now, "bbp": bbp,
             "gap_pct": gap_pct, "depth": depth,
-            "top_bids": top_bids
+            "top_bids": top_bids,
         })
         if len(records) > MAX_HISTORY:
             records.pop(0)
