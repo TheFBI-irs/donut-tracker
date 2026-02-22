@@ -285,8 +285,11 @@ def run_bot():
     if not token:
         logger.error("DISCORD_BOT_TOKEN not set — interactive bot disabled.")
         return
-    logger.info("Starting Discord bot...")
-    bot.run(token)
+    try:
+        logger.info("Starting Discord bot...")
+        bot.run(token)
+    except Exception as e:
+        logger.error(f"Discord bot failed: {e}. Main scan loop will continue without it.")
 
 
 def start_bot_thread():
