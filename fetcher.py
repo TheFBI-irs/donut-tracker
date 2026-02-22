@@ -46,3 +46,11 @@ def fetch_all_orders() -> list:
 
     logger.info(f"Fetched {len(all_orders)} total orders across {page} page(s)")
     return all_orders
+
+def fetch_sample():
+    """Print first 3 raw orders to inspect field semantics."""
+    import json
+    response = requests.get(API_URL, timeout=15)
+    data = response.json()
+    for order in data["orders"][:3]:
+        print(json.dumps(order, indent=2))
