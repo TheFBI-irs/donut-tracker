@@ -34,12 +34,13 @@ HISTORY_FILE = "price_history.json"
 MAX_HISTORY = 48        # ~24 hours of 30-min samples
 
 FAIR_VALUES = {
-    "elytra": 280_000_000,
-    "netherite_ingot": 2_500_000,
-    "netherite_block": 5_000_000,
-    "dragon_head": 90_000_000,
-    "enchanted_golden_apple": 3_500_000,
+    "elytra": 280000000,
+    "netherite_ingot": 4300000,
+    "netherite_block": 38000000,
+    "dragon_head": 26000000,
+    "enchanted_golden_apple": 620000,
 }
+
 
 # ---------------------------------------------------------------------------
 # Persistent history
