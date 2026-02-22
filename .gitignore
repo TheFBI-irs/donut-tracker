@@ -1,0 +1,5 @@
+.env
+market_history.db
+price_history.json
+donut_bot.log
+__pycache__/
