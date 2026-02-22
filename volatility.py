@@ -40,3 +40,7 @@ def crash_risk(prices):
     trend = prices[-1] - prices[-5]
 
     return recent_vol > historical_vol * 1.8 and trend < 0
+
+
+
+

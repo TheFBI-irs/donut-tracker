@@ -1,79 +1,84 @@
-from collections import Counter
-from storage import load_prices, save_prices
-from volatility import crash_risk
+# tracker.py
+
+from config import WATCH_ITEMS
+
+FAIR_VALUES = {
+    "elytra": 280_000_000,
+    "netherite_block": 5_000_000,
+    "dragon_head": 90_000_000,
+    "enchanted_golden_apple": 3_500_000,
+}
+
+price_history = {}
 
 
-def filter_item(orders, item_name):
-    return [
-        o for o in orders
-        if o["item"]["itemId"] == item_name
-    ]
+def detect_volatility(item, price):
+    history = price_history.setdefault(item, [])
+    history.append(price)
 
+    if len(history) > 10:
+        history.pop(0)
 
-# ---------------- PRICE TRACKING ----------------
-
-def extract_market_price(orders):
-    if not orders:
+    if len(history) < 5:
         return None
 
-    prices = [o["itemPrice"] for o in orders]
-    return min(prices)  # lowest listing = market price
+    avg = sum(history) / len(history)
+    variance = sum((p - avg) ** 2 for p in history) / len(history)
+    volatility = (variance ** 0.5) / avg
+
+    if volatility > 0.12:
+        return f"⚠️ HIGH VOLATILITY detected for {item}"
+
+    return None
 
 
-def update_price_history(item, price):
-    data = load_prices()
+def analyze_market(orders):
+    alerts = []
+    market_data = {}
 
-    if item not in data:
-        data[item] = []
+    # Aggregate orders
+    for order in orders:
+        item = order["item"]["itemId"]
 
-    data[item].append(price)
+        if item not in WATCH_ITEMS:
+            continue
 
-    data[item] = data[item][-500:]  # keep history bounded
+        price = order["itemPrice"]
+        remaining = order["amountOrdered"] - order["amountDelivered"]
 
-    save_prices(data)
+        if remaining <= 0:
+            continue
 
-    return data[item]
+        if item not in market_data:
+            market_data[item] = {
+                "total_value": 0,
+                "total_volume": 0,
+            }
 
+        market_data[item]["total_value"] += price * remaining
+        market_data[item]["total_volume"] += remaining
 
-# ---------------- SIGNALS ----------------
+    # Compute VWPI + signals
+    for item, data in market_data.items():
+        vwpi = data["total_value"] / data["total_volume"]
 
-def detect_listing_flood(orders):
-    return len(orders) >= 12
-
-
-def detect_whale_activity(orders):
-    counter = Counter()
-
-    for o in orders:
-        if o["amountOrdered"] >= 10:
-            counter[o["userName"]] += o["amountOrdered"]
-
-    whales = [u for u, amt in counter.items() if amt >= 20]
-    return whales
-
-
-# ---------------- MASTER ANALYSIS ----------------
-
-def analyze_market(all_orders, item):
-    item_orders = filter_item(all_orders, item)
-
-    signals = []
-
-    price = extract_market_price(item_orders)
-
-    if price:
-        history = update_price_history(item, price)
-
-        if crash_risk(history):
-            signals.append("⚠️ HIGH CRASH RISK (volatility expansion)")
-
-    if detect_listing_flood(item_orders):
-        signals.append("📉 Listing flood detected")
-
-    whales = detect_whale_activity(item_orders)
-    if whales:
-        signals.append(
-            "🐋 Whale accumulation: " + ", ".join(whales)
+        alerts.append(
+            f"📊 {item} VWPI price: {int(vwpi):,}"
         )
 
-    return signals
+        # volatility alert
+        vol_alert = detect_volatility(item, vwpi)
+        if vol_alert:
+            alerts.append(vol_alert)
+
+        # buy/sell signals
+        fair = FAIR_VALUES.get(item)
+
+        if fair:
+            if vwpi < fair * 0.85:
+                alerts.append(f"🟢 BUY SIGNAL: {item} undervalued")
+
+            elif vwpi > fair * 1.25:
+                alerts.append(f"🔴 SELL SIGNAL: {item} overvalued")
+
+    return alerts

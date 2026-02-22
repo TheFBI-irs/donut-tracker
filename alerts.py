@@ -12,3 +12,4 @@ def send_alert(message):
     }
 
     requests.post(DISCORD_WEBHOOK, json=payload)
+
