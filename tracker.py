@@ -1,23 +1,9 @@
 """
-tracker.py — Market intelligence for Donut SMP
+tracker.py — Watch-list alerts with self-calibrating demand pressure.
 
-DEMAND MODEL:
-  Unit volume is meaningless — players store money in troll orders like
-  "buy 10,000,000 elytras at 1 coin each."
-
-  Real demand signal = BID DENSITY: how tightly are serious buyers
-  clustered? In a competitive market, players outbid each other by small
-  margins. In a dead market, gaps between bids are huge.
-
-  METRIC: Average Gap % = mean gap between top N bids / top bid price
-    - Small gap%  → buyers competing hard → high demand
-    - Large gap%  → nobody is fighting for supply → low demand
-    - Gap% falling over time → demand building
-    - Gap% rising over time  → demand evaporating
-
-PRICE MODEL:
-  Best Bid Price (BBP) = average of top N bids above troll floor.
-  Tracks what serious buyers are actually willing to pay right now.
+Demand pressure is relative to each item's own historical baseline,
+not fixed global thresholds. The system learns what "normal" looks like
+per item and signals deviations from that — no assumptions required.
 """
 
 import json
@@ -28,22 +14,12 @@ from config import WATCH_ITEMS
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-TOP_N_BIDS = 10         # Bids used for gap analysis and BBP
-MIN_BID_FLOOR = 1000    # Hard troll filter — ignore anything below this
-HISTORY_FILE = "price_history.json"
-MAX_HISTORY = 48        # ~24 hours at 30-min intervals
-
-# Demand pressure thresholds (gap as % of top bid)
-GAP_HIGH_DEMAND   = 0.005   # <0.5% gap  → very competitive
-GAP_MEDIUM_DEMAND = 0.02    # <2% gap    → moderate competition
-# >2% gap = low demand / thin market
-
-# Volatility threshold: BBP move between two consecutive scans
-VOLATILITY_THRESHOLD = 0.05  # 5% change scan-to-scan
+TOP_N_BIDS       = 10
+MIN_BID_FLOOR    = 1000
+HISTORY_FILE     = "price_history.json"
+MAX_HISTORY      = 48       # ~24 hours at 30-min intervals
+CALIBRATION_MIN  = 10       # scans needed before demand labels mean anything
+VOLATILITY_THRESHOLD = 0.05
 
 FAIR_VALUES = {
     "elytra":                  280_000_000,
@@ -54,9 +30,7 @@ FAIR_VALUES = {
 }
 
 # ---------------------------------------------------------------------------
-# Persistent history
-# Record per scan:
-#   { "ts": str, "bbp": float, "gap_pct": float, "top_bids": [int, ...] }
+# Persistent history (JSON, watch-list items only)
 # ---------------------------------------------------------------------------
 
 def load_history() -> dict:
@@ -84,148 +58,123 @@ price_history: dict = load_history()
 # ---------------------------------------------------------------------------
 
 def compute_top_bids(bids: list) -> list:
-    """Return top N real bids sorted descending, above troll floor."""
     return sorted([b for b in bids if b >= MIN_BID_FLOOR], reverse=True)[:TOP_N_BIDS]
 
 def compute_bbp(top_bids: list) -> float | None:
-    """Average of top N bids. None if no real bids exist."""
     if not top_bids:
         return None
     return sum(top_bids) / len(top_bids)
 
 def compute_gap_pct(top_bids: list) -> float | None:
-    """
-    Average gap between consecutive top bids, as % of the highest bid.
-    Requires at least 2 bids.
-
-    Small value = buyers are tightly competing (high demand).
-    Large value = wide spacing between bids (low demand / thin market).
-    """
     if len(top_bids) < 2:
         return None
     gaps = [top_bids[i] - top_bids[i + 1] for i in range(len(top_bids) - 1)]
-    avg_gap = sum(gaps) / len(gaps)
-    return avg_gap / top_bids[0]
+    return (sum(gaps) / len(gaps)) / top_bids[0]
 
-def describe_demand(gap_pct: float) -> str:
-    if gap_pct < GAP_HIGH_DEMAND:
-        return "🔥 HIGH"
-    elif gap_pct < GAP_MEDIUM_DEMAND:
-        return "🟡 MEDIUM"
+# ---------------------------------------------------------------------------
+# Self-calibrating demand label
+# Compares current gap% to item's own historical baseline.
+# No fixed thresholds — the item defines its own "normal."
+# ---------------------------------------------------------------------------
+
+def describe_demand(item: str, gap_pct: float) -> str:
+    records = price_history.get(item, [])
+    historical_gaps = [r["gap_pct"] for r in records if r.get("gap_pct") is not None]
+
+    n = len(historical_gaps)
+    if n < CALIBRATION_MIN:
+        return f"📊 CALIBRATING ({n}/{CALIBRATION_MIN} scans, gap {gap_pct*100:.2f}%)"
+
+    avg  = sum(historical_gaps) / n
+    variance = sum((g - avg) ** 2 for g in historical_gaps) / n
+    std  = variance ** 0.5
+
+    # z-score: how many standard deviations from item's own mean?
+    z = (gap_pct - avg) / std if std > 0 else 0
+
+    if z < -1.5:
+        return f"🔥 HIGH (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
+    elif z > 1.5:
+        return f"🧊 LOW  (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
     else:
-        return "🧊 LOW"
+        return f"🟡 MEDIUM (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
 
 # ---------------------------------------------------------------------------
 # Signal detectors
 # ---------------------------------------------------------------------------
 
 def detect_demand_shift(item: str) -> str | None:
-    """
-    Detects meaningful change in bid density over last 3 scans.
-    Gap % rising = demand weakening. Gap % falling = demand building.
-    """
     records = price_history.get(item, [])
     gaps = [r["gap_pct"] for r in records if r.get("gap_pct") is not None]
-
     if len(gaps) < 4:
         return None
 
-    prev_avg = sum(gaps[-4:-1]) / 3   # average of 3 scans before current
+    prev_avg = sum(gaps[-4:-1]) / 3
     curr = gaps[-1]
-
     if prev_avg == 0:
         return None
 
     change = (curr - prev_avg) / prev_avg
-
-    if change > 0.5:   # gaps widened 50%+ → buyers backing off
-        return (
-            f"📉 DEMAND WEAKENING: **{item}** — bid gaps widened "
-            f"{change:.0%} vs recent avg (buyers spreading out)"
-        )
-    elif change < -0.5:   # gaps tightened 50%+ → buyers competing harder
-        return (
-            f"📈 DEMAND BUILDING: **{item}** — bid gaps tightened "
-            f"{abs(change):.0%} vs recent avg (buyers competing harder)"
-        )
+    if change > 0.50:
+        return f"📉 DEMAND WEAKENING: **{item}** — bid gaps widened {change:.0%} vs recent avg"
+    elif change < -0.50:
+        return f"📈 DEMAND BUILDING: **{item}** — bid gaps tightened {abs(change):.0%} vs recent avg"
     return None
 
 
 def detect_volatility(item: str) -> str | None:
-    """BBP moved >5% between last two scans."""
     records = price_history.get(item, [])
     prices = [r["bbp"] for r in records if r.get("bbp")]
-
     if len(prices) < 2:
         return None
-
     prev, curr = prices[-2], prices[-1]
     if prev == 0:
         return None
-
     change_pct = (curr - prev) / prev
     if abs(change_pct) >= VOLATILITY_THRESHOLD:
         direction = "▲" if change_pct > 0 else "▼"
         return (
-            f"⚠️ PRICE MOVE: **{item}** BBP {direction}{abs(change_pct):.1%} "
-            f"since last scan ({int(prev):,} → {int(curr):,})"
+            f"⚠️ PRICE MOVE: **{item}** {direction}{abs(change_pct):.1%} "
+            f"({int(prev):,} → {int(curr):,})"
         )
     return None
 
 
 def detect_trend(item: str) -> str | None:
-    """Short MA vs long MA on BBP. Only signals when divergence > 3%."""
     records = price_history.get(item, [])
     prices = [r["bbp"] for r in records if r.get("bbp")]
-
     if len(prices) < 10:
         return None
-
     short_ma = sum(prices[-3:]) / 3
-    long_ma = sum(prices[-10:]) / 10
-    delta_pct = (short_ma - long_ma) / long_ma
-
-    if abs(delta_pct) < 0.03:
+    long_ma  = sum(prices[-10:]) / 10
+    delta    = (short_ma - long_ma) / long_ma
+    if abs(delta) < 0.03:
         return None
-
     if short_ma < long_ma:
         return (
-            f"📉 BEARISH TREND: **{item}** "
-            f"(3-scan MA {int(short_ma):,} < 10-scan MA {int(long_ma):,}, Δ {delta_pct:.1%})"
+            f"📉 BEARISH: **{item}** "
+            f"3-scan MA {int(short_ma):,} < 10-scan MA {int(long_ma):,} (Δ {delta:.1%})"
         )
     return (
-        f"📈 BULLISH TREND: **{item}** "
-        f"(3-scan MA {int(short_ma):,} > 10-scan MA {int(long_ma):,}, Δ +{delta_pct:.1%})"
+        f"📈 BULLISH: **{item}** "
+        f"3-scan MA {int(short_ma):,} > 10-scan MA {int(long_ma):,} (Δ +{delta:.1%})"
     )
 
 
-def detect_crash_risk(item: str, current_bbp: float, current_gap_pct: float) -> str | None:
-    """
-    Crash = BBP falling AND bid gaps widening simultaneously.
-    Buyers losing conviction: top bids drop AND competition evaporates.
-    """
+def detect_crash_risk(item: str, bbp: float, gap_pct: float) -> str | None:
     records = price_history.get(item, [])
     if len(records) < 3:
         return None
-
-    recent_prices = [r["bbp"] for r in records[-3:] if r.get("bbp")]
+    recent_prices = [r["bbp"]     for r in records[-3:] if r.get("bbp")]
     recent_gaps   = [r["gap_pct"] for r in records[-3:] if r.get("gap_pct") is not None]
-
     if not recent_prices or not recent_gaps:
         return None
-
     avg_price = sum(recent_prices) / len(recent_prices)
     avg_gap   = sum(recent_gaps)   / len(recent_gaps)
-
-    price_falling   = current_bbp     < avg_price * 0.95
-    demand_thinning = current_gap_pct > avg_gap   * 1.5
-
-    if price_falling and demand_thinning:
-        price_drop = (1 - current_bbp / avg_price)
-        gap_change = (current_gap_pct / avg_gap - 1)
+    if bbp < avg_price * 0.95 and gap_pct > avg_gap * 1.5:
         return (
-            f"🚨 CRASH RISK: **{item}** — BBP down {price_drop:.1%} AND bid gaps "
-            f"widened {gap_change:.0%}. Buyers losing conviction fast."
+            f"🚨 CRASH RISK: **{item}** — BBP down {(1 - bbp/avg_price):.1%} AND "
+            f"bid gaps widened {(gap_pct/avg_gap - 1):.0%}. Buyers losing conviction."
         )
     return None
 
@@ -249,65 +198,51 @@ def analyze_market(orders: list) -> list:
     now = datetime.utcnow().isoformat()
 
     for item in WATCH_ITEMS:
-        bids = item_bids.get(item, [])
-        top_bids = compute_top_bids(bids)
-        bbp = compute_bbp(top_bids)
+        bids      = item_bids.get(item, [])
+        top_bids  = compute_top_bids(bids)
+        bbp       = compute_bbp(top_bids)
 
         if bbp is None:
             alerts.append(f"❓ **{item}** — no meaningful bids this scan")
             continue
 
-        gap_pct = compute_gap_pct(top_bids)
-        demand_label = describe_demand(gap_pct) if gap_pct is not None else "❓ UNKNOWN"
-        top_display = [f"{b:,}" for b in top_bids[:3]]
+        gap_pct      = compute_gap_pct(top_bids)
+        top_display  = [f"{b:,}" for b in top_bids[:3]]
+        demand_label = describe_demand(item, gap_pct) if gap_pct is not None else "❓"
 
         alerts.append(
             f"📊 **{item}** | BBP: {int(bbp):,} | "
             f"Top 3: [{', '.join(top_display)}] | "
-            f"Demand pressure: {demand_label} "
-            f"(gap {gap_pct*100:.2f}% of top bid)"
+            f"Demand: {demand_label}"
         )
 
-        # Persist BEFORE running detectors so they see the current sample
+        # Persist BEFORE detectors so current sample is visible to them
         records = price_history.setdefault(item, [])
-        records.append({
-            "ts": now,
-            "bbp": bbp,
-            "gap_pct": gap_pct,
-            "top_bids": top_bids,
-        })
+        records.append({"ts": now, "bbp": bbp, "gap_pct": gap_pct, "top_bids": top_bids})
         if len(records) > MAX_HISTORY:
             records.pop(0)
 
-        # Signals: crash > volatility > demand shift > trend > fair value
-        crash = detect_crash_risk(item, bbp, gap_pct if gap_pct else 0)
-        if crash:
-            alerts.append(crash)
-
-        vol = detect_volatility(item)
-        if vol:
-            alerts.append(vol)
-
-        demand_shift = detect_demand_shift(item)
-        if demand_shift:
-            alerts.append(demand_shift)
-
-        trend = detect_trend(item)
-        if trend:
-            alerts.append(trend)
+        for signal in [
+            detect_crash_risk(item, bbp, gap_pct or 0),
+            detect_volatility(item),
+            detect_demand_shift(item),
+            detect_trend(item),
+        ]:
+            if signal:
+                alerts.append(signal)
 
         fair = FAIR_VALUES.get(item)
         if fair:
             ratio = bbp / fair
             if ratio < 0.85:
                 alerts.append(
-                    f"🟢 BBP BELOW FAIR: **{item}** at {ratio:.0%} of fair value "
-                    f"({int(bbp):,} vs {fair:,}) — buyers paying below fair"
+                    f"🟢 BBP BELOW FAIR: **{item}** at {ratio:.0%} of fair "
+                    f"({int(bbp):,} vs {fair:,})"
                 )
             elif ratio > 1.15:
                 alerts.append(
-                    f"🔴 BBP ABOVE FAIR: **{item}** at {ratio:.0%} of fair value "
-                    f"({int(bbp):,} vs {fair:,}) — buyers paying above fair"
+                    f"🔴 BBP ABOVE FAIR: **{item}** at {ratio:.0%} of fair "
+                    f"({int(bbp):,} vs {fair:,})"
                 )
 
     save_history(price_history)
