@@ -21,9 +21,9 @@ VOLATILITY_THRESHOLD = 0.12     # 12%
 CHECK_INTERVAL = 1800           # 30 minutes (API limit)
 
 FAIR_VALUES = {
-    "elytra": 280_000_000,
-    "netherite_ingot": 4_300_000,
-    "netherite_block": 38_000_000,
-    "dragon_head": 26_000_000,
-    "enchanted_golden_apple": 620_000,
+    "elytra": 280000000,
+    "netherite_ingot": 4300000,
+    "netherite_block": 38000000,
+    "dragon_head": 26000000,
+    "enchanted_golden_apple": 620000,
 }
