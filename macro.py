@@ -119,7 +119,7 @@ def market_breadth() -> str | None:
     if pct_up > 0.65:
         return f"📈 BULL MARKET: {rising}/{total} items rising ({pct_up:.0%} breadth)"
     elif pct_up < 0.35:
-        return f"📉 BEAR MARKET: {falling}/{total} items falling ({1-pct_up:.0%} breadth)"
+        return f"📉 BEAR MARKET: {falling}/{total} items falling ({falling/total:.0%} breadth)"
     return None
 
 
