@@ -1,3 +1,21 @@
+"""
+tracker.py — Market intelligence for Donut SMP
+
+KEY INSIGHT:
+  /orders returns BUY ORDERS (bids) only — not sell listings.
+  Players post "I will pay X for item Y." When someone delivers, they get paid.
+
+  VWPI (volume-weighted average) is useless here because troll orders
+  (e.g., 1 coin for an elytra) drag the average to near zero.
+
+  CORRECT MODEL:
+    - Take the top N highest bids per item ("best bids").
+    - Average them → Best Bid Price (BBP).
+    - Track BBP over time.
+    - High bids = real demand that will actually get filled.
+    - Low bids = noise/trolls, ignored entirely.
+"""
+
 import json
 import os
 import logging
@@ -6,26 +24,38 @@ from config import WATCH_ITEMS
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+TOP_N_BIDS = 5          # Number of highest bids to average for price signal
+MIN_BID_FLOOR = 1000    # Ignore bids below this — troll/dust filter
+HISTORY_FILE = "price_history.json"
+MAX_HISTORY = 48        # ~24 hours of 30-min samples
+
 FAIR_VALUES = {
     "elytra": 280_000_000,
+    "netherite_ingot": 2_500_000,
     "netherite_block": 5_000_000,
     "dragon_head": 90_000_000,
     "enchanted_golden_apple": 3_500_000,
 }
 
-HISTORY_FILE = "price_history.json"
-
-# --- Persistent history ---
+# ---------------------------------------------------------------------------
+# Persistent history
+# Each item stores a list of:
+#   { "ts": ISO string, "bbp": float, "top_bids": [int, ...], "demand": int }
+# ---------------------------------------------------------------------------
 
 def load_history() -> dict:
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
                 data = json.load(f)
-                logger.info(f"Loaded price history from {HISTORY_FILE}")
+                logger.info(f"Loaded price history ({HISTORY_FILE})")
                 return data
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not load history file: {e}. Starting fresh.")
+            logger.warning(f"Could not load history: {e}. Starting fresh.")
     return {}
 
 def save_history(history: dict):
@@ -35,166 +65,202 @@ def save_history(history: dict):
     except OSError as e:
         logger.error(f"Failed to save price history: {e}")
 
-# In-memory history loaded once at module init
-# Each key: item name
-# Each value: list of {"ts": ISO timestamp, "vwpi": float, "supply": int}
 price_history: dict = load_history()
 
-MAX_HISTORY = 20  # keep last 20 samples per item
+# ---------------------------------------------------------------------------
+# Core price signal: Best Bid Price (BBP)
+# ---------------------------------------------------------------------------
 
-# --- Volatility ---
-
-def detect_volatility(item: str, vwpi: float) -> str | None:
-    records = price_history.get(item, [])
-    prices = [r["vwpi"] for r in records]
-
-    if len(prices) < 5:
+def compute_bbp(bids: list) -> float | None:
+    """
+    Average the top N bids above the troll floor.
+    Returns None if there aren't enough real bids.
+    """
+    real_bids = sorted(
+        [b for b in bids if b >= MIN_BID_FLOOR],
+        reverse=True
+    )
+    if not real_bids:
         return None
+    top = real_bids[:TOP_N_BIDS]
+    return sum(top) / len(top)
 
-    avg = sum(prices) / len(prices)
-    variance = sum((p - avg) ** 2 for p in prices) / len(prices)
-    volatility = (variance ** 0.5) / avg
+# ---------------------------------------------------------------------------
+# Signal detectors
+# ---------------------------------------------------------------------------
 
-    if volatility > 0.12:
-        return f"⚠️ HIGH VOLATILITY: **{item}** (σ/μ = {volatility:.1%})"
-    return None
-
-# --- Trend detection ---
-
-def detect_trend(item: str) -> str | None:
+def detect_trend(item: str, current_bbp: float) -> str | None:
     records = price_history.get(item, [])
-    prices = [r["vwpi"] for r in records]
+    prices = [r["bbp"] for r in records if r.get("bbp")]
 
     if len(prices) < 10:
         return None
 
     short_ma = sum(prices[-3:]) / 3
     long_ma = sum(prices[-10:]) / 10
-
     delta_pct = (short_ma - long_ma) / long_ma
 
-    # Only signal if the divergence is meaningful (>3%)
     if abs(delta_pct) < 0.03:
         return None
 
     if short_ma < long_ma:
         return (
             f"📉 BEARISH TREND: **{item}** "
-            f"(3-MA {int(short_ma):,} < 10-MA {int(long_ma):,}, Δ {delta_pct:.1%})"
+            f"(3-sample MA {int(short_ma):,} < 10-sample MA {int(long_ma):,}, Δ {delta_pct:.1%})"
         )
     else:
         return (
             f"📈 BULLISH TREND: **{item}** "
-            f"(3-MA {int(short_ma):,} > 10-MA {int(long_ma):,}, Δ +{delta_pct:.1%})"
+            f"(3-sample MA {int(short_ma):,} > 10-sample MA {int(long_ma):,}, Δ +{delta_pct:.1%})"
         )
 
-# --- Crash / supply shock detector ---
 
-def detect_crash_risk(item: str, current_supply: int, current_vwpi: float) -> str | None:
+def detect_volatility(item: str) -> str | None:
+    """
+    Volatility = are top bids moving a lot between scans?
+    Uses % change in BBP between the last two samples.
+    """
     records = price_history.get(item, [])
+    prices = [r["bbp"] for r in records if r.get("bbp")]
 
+    if len(prices) < 2:
+        return None
+
+    prev = prices[-2]
+    curr = prices[-1]
+    if prev == 0:
+        return None
+
+    change_pct = (curr - prev) / prev
+
+    if abs(change_pct) >= 0.05:
+        direction = "▲" if change_pct > 0 else "▼"
+        return (
+            f"⚠️ VOLATILITY: **{item}** top bids moved "
+            f"{direction}{abs(change_pct):.1%} since last scan"
+        )
+    return None
+
+
+def detect_crash_risk(item: str, current_demand: int, current_bbp: float) -> str | None:
+    """
+    Crash signal: top bids dropping AND demand volume rising
+    (people posting more low bids, high bids disappearing = panic/supply dump incoming).
+    """
+    records = price_history.get(item, [])
     if len(records) < 3:
         return None
 
-    recent_supplies = [r["supply"] for r in records[-3:]]
-    avg_recent_supply = sum(recent_supplies) / len(recent_supplies)
+    recent_demands = [r["demand"] for r in records[-3:] if r.get("demand") is not None]
+    recent_prices = [r["bbp"] for r in records[-3:] if r.get("bbp")]
 
-    if avg_recent_supply == 0:
+    if not recent_demands or not recent_prices:
         return None
 
-    supply_ratio = current_supply / avg_recent_supply
+    avg_demand = sum(recent_demands) / len(recent_demands)
+    avg_price = sum(recent_prices) / len(recent_prices)
 
-    # Supply spike: >50% above recent average
-    supply_spiked = supply_ratio > 1.5
+    demand_spiked = avg_demand > 0 and (current_demand / avg_demand) > 1.5
+    price_falling = current_bbp < avg_price * 0.95
 
-    # Price falling: current VWPI below 3-sample average
-    recent_prices = [r["vwpi"] for r in records[-3:]]
-    avg_recent_price = sum(recent_prices) / len(recent_prices)
-    price_falling = current_vwpi < avg_recent_price * 0.97
-
-    if supply_spiked and price_falling:
+    if demand_spiked and price_falling:
+        demand_ratio = current_demand / avg_demand
+        price_drop = (1 - current_bbp / avg_price)
         return (
-            f"🚨 MARKET RISK: **{item}** supply surge detected — possible crash! "
-            f"(Supply ×{supply_ratio:.1f} vs recent avg, VWPI down {(1 - current_vwpi/avg_recent_price):.1%})"
+            f"🚨 MARKET RISK: **{item}** — demand orders up ×{demand_ratio:.1f} "
+            f"while top bids fell {price_drop:.1%}. Possible supply dump / crash incoming."
         )
-    elif supply_spiked:
+    elif demand_spiked:
         return (
-            f"⚠️ SUPPLY SPIKE: **{item}** listings up ×{supply_ratio:.1f} vs recent avg — monitor closely"
+            f"⚠️ DEMAND SPIKE: **{item}** — order volume up ×{current_demand/avg_demand:.1f}. Monitor closely."
         )
-
     return None
 
-# --- Core analysis ---
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
-def analyze_market(orders: list) -> list[str]:
+def analyze_market(orders: list) -> list:
     alerts = []
-    market_data: dict = {}
+
+    # Group all bids per item
+    item_bids = {}
+    item_demand = {}  # total unfilled units demanded
 
     for order in orders:
         item = order["item"]["itemId"]
-
         if item not in WATCH_ITEMS:
             continue
 
         price = order["itemPrice"]
         remaining = order["amountOrdered"] - order["amountDelivered"]
-
         if remaining <= 0:
             continue
 
-        if item not in market_data:
-            market_data[item] = {"total_value": 0, "total_volume": 0}
-
-        market_data[item]["total_value"] += price * remaining
-        market_data[item]["total_volume"] += remaining
+        item_bids.setdefault(item, []).append(price)
+        item_demand[item] = item_demand.get(item, 0) + remaining
 
     now = datetime.utcnow().isoformat()
 
-    for item, data in market_data.items():
-        if data["total_volume"] == 0:
+    for item in WATCH_ITEMS:
+        bids = item_bids.get(item, [])
+        demand = item_demand.get(item, 0)
+
+        bbp = compute_bbp(bids)
+
+        if bbp is None:
+            alerts.append(f"❓ **{item}** — no meaningful bids found this scan")
             continue
 
-        vwpi = data["total_value"] / data["total_volume"]
-        supply = data["total_volume"]
+        # Top bids for display
+        real_bids = sorted([b for b in bids if b >= MIN_BID_FLOOR], reverse=True)
+        top_display = [f"{b:,}" for b in real_bids[:3]]
 
-        # --- Update persistent history ---
+        alerts.append(
+            f"📊 **{item}** | Best Bid: {int(bbp):,} | "
+            f"Top 3: [{', '.join(top_display)}] | "
+            f"Demand: {demand:,} units"
+        )
+
+        # Update persistent history BEFORE running detectors so
+        # detect_volatility and detect_trend see the current sample
         records = price_history.setdefault(item, [])
-        records.append({"ts": now, "vwpi": vwpi, "supply": supply})
+        records.append({
+            "ts": now,
+            "bbp": bbp,
+            "top_bids": real_bids[:TOP_N_BIDS],
+            "demand": demand,
+        })
         if len(records) > MAX_HISTORY:
             records.pop(0)
 
-        # --- Always emit a price summary ---
-        alerts.append(
-            f"📊 **{item}** | VWPI: {int(vwpi):,} | Supply: {supply:,} units"
-        )
+        # Signals ordered: crash > volatility > trend > fair value
+        crash = detect_crash_risk(item, demand, bbp)
+        if crash:
+            alerts.append(crash)
 
-        # --- Signals ---
-        crash_alert = detect_crash_risk(item, supply, vwpi)
-        if crash_alert:
-            alerts.append(crash_alert)
+        vol = detect_volatility(item)
+        if vol:
+            alerts.append(vol)
 
-        trend_alert = detect_trend(item)
-        if trend_alert:
-            alerts.append(trend_alert)
-
-        vol_alert = detect_volatility(item, vwpi)
-        if vol_alert:
-            alerts.append(vol_alert)
+        trend = detect_trend(item, bbp)
+        if trend:
+            alerts.append(trend)
 
         fair = FAIR_VALUES.get(item)
         if fair:
-            if vwpi < fair * 0.85:
-                discount = (1 - vwpi / fair)
+            ratio = bbp / fair
+            if ratio < 0.85:
                 alerts.append(
-                    f"🟢 BUY SIGNAL: **{item}** undervalued by {discount:.1%} vs fair value {fair:,}"
+                    f"🟢 STRONG DEMAND: **{item}** top bids at {ratio:.0%} of fair value "
+                    f"({int(bbp):,} vs {fair:,}) — buyers paying below fair, good time to source and fill"
                 )
-            elif vwpi > fair * 1.25:
-                premium = (vwpi / fair - 1)
+            elif ratio > 1.15:
                 alerts.append(
-                    f"🔴 SELL SIGNAL: **{item}** overvalued by +{premium:.1%} vs fair value {fair:,}"
+                    f"🔴 PREMIUM DEMAND: **{item}** top bids at {ratio:.0%} of fair value "
+                    f"({int(bbp):,} vs {fair:,}) — buyers paying above fair, good time to sell into orders"
                 )
 
-    # Persist updated history after all processing
     save_history(price_history)
 
     if not alerts:
