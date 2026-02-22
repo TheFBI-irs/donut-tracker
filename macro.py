@@ -1,99 +1,50 @@
 """
-macro.py — Economy-wide market intelligence.
+macro.py — Economy-wide signals + regime change detection.
 
-Reads the full historian database (all items, all scans) to detect
-patterns that are invisible when watching 5 items in isolation:
+REGIME CHANGE:
+  A regime change is when the economy's structure shifts fundamentally —
+  world border expansion, server reset, mass liquidation event.
 
-  - Broad market regime: is the economy heating up or cooling down?
-  - Correlated crashes: multiple items moving together = systemic event
-  - Leaders and laggards: which items move first, which follow?
-  - Unusual movers: items outside watch-list that are spiking
-  - Market breadth: what % of items are in uptrend vs downtrend?
+  Detection: if >50% of all items move >10% in the same scan direction,
+  it's almost certainly a structural event, not normal price action.
+
+  Response:
+    1. Fire a high-priority alert describing the event
+    2. Call tracker.reset_calibration() to wipe all rolling baselines
+    3. System recalibrates from the new post-event reality automatically
+
+  This prevents pre-event calibration data from poisoning signals
+  for days after a world border expansion.
 """
 
 import logging
-from historian import get_all_items_latest, get_item_history, get_scan_count, _connect
+from historian import get_all_items_latest, get_scan_count, _connect
 
 logger = logging.getLogger(__name__)
 
-# Minimum scans before macro signals are meaningful
-MACRO_MIN_SCANS = 20
-
-# How many top movers to surface in alerts
-TOP_MOVERS_N = 5
+MACRO_MIN_SCANS        = 20
+TOP_MOVERS_N           = 5
+REGIME_CHANGE_THRESHOLD = 0.50   # fraction of items that must move together
+REGIME_MOVE_PCT        = 0.10    # each item must move at least this much
 
 
 def _require_scans(n: int) -> bool:
     count = get_scan_count()
     if count < n:
-        logger.info(f"Macro: only {count}/{n} scans recorded, still calibrating.")
+        logger.info(f"Macro: {count}/{n} scans, still calibrating.")
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# Broad market regime
-# Looks at what fraction of all items have rising vs falling BBP
-# over the last 3 scans. Surfaces overall market direction.
+# Regime change detector
 # ---------------------------------------------------------------------------
 
-def market_breadth() -> str | None:
-    if not _require_scans(MACRO_MIN_SCANS):
-        return None
-
-    with _connect() as conn:
-        # Get last 3 scan IDs
-        scan_ids = [r[0] for r in conn.execute(
-            "SELECT id FROM scans ORDER BY id DESC LIMIT 3"
-        ).fetchall()]
-
-    if len(scan_ids) < 3:
-        return None
-
-    newest, middle, oldest = scan_ids[0], scan_ids[1], scan_ids[2]
-
-    with _connect() as conn:
-        # Items present in all 3 scans
-        rows = conn.execute("""
-            SELECT a.item_id,
-                   a.bbp AS bbp_new,
-                   b.bbp AS bbp_old
-            FROM snapshots a
-            JOIN snapshots b
-              ON a.item_id = b.item_id AND b.scan_id = ?
-            WHERE a.scan_id = ?
-              AND a.bbp IS NOT NULL
-              AND b.bbp IS NOT NULL
-        """, (oldest, newest)).fetchall()
-
-    if not rows:
-        return None
-
-    rising  = sum(1 for r in rows if r["bbp_new"] > r["bbp_old"] * 1.01)
-    falling = sum(1 for r in rows if r["bbp_new"] < r["bbp_old"] * 0.99)
-    total   = len(rows)
-    pct_up  = rising / total
-
-    if pct_up > 0.65:
-        return (
-            f"📈 BULL MARKET: {rising}/{total} items rising "
-            f"({pct_up:.0%} breadth) — broad economy heating up"
-        )
-    elif pct_up < 0.35:
-        return (
-            f"📉 BEAR MARKET: {falling}/{total} items falling "
-            f"({1-pct_up:.0%} breadth) — broad economy cooling down"
-        )
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Correlated crash detector
-# If multiple items from different categories all drop simultaneously,
-# it's a systemic event (world border, server reset, mass sell-off).
-# ---------------------------------------------------------------------------
-
-def correlated_crash() -> str | None:
+def detect_regime_change() -> str | None:
+    """
+    Returns a description string if a regime change is detected, else None.
+    Caller is responsible for triggering calibration reset.
+    """
     if not _require_scans(MACRO_MIN_SCANS):
         return None
 
@@ -110,8 +61,6 @@ def correlated_crash() -> str | None:
     with _connect() as conn:
         rows = conn.execute("""
             SELECT a.item_id,
-                   a.bbp AS bbp_new,
-                   b.bbp AS bbp_old,
                    (a.bbp - b.bbp) / b.bbp AS pct_change
             FROM snapshots a
             JOIN snapshots b
@@ -119,24 +68,94 @@ def correlated_crash() -> str | None:
             WHERE a.scan_id = ?
               AND a.bbp IS NOT NULL AND b.bbp IS NOT NULL
               AND b.bbp > 0
-              AND (a.bbp - b.bbp) / b.bbp < -0.07
-            ORDER BY pct_change ASC
         """, (previous, newest)).fetchall()
 
-    if len(rows) >= 5:
-        names = [r["item_id"] for r in rows[:5]]
-        worst = rows[0]["pct_change"]
+    if not rows:
+        return None
+
+    total   = len(rows)
+    rising  = [r for r in rows if r["pct_change"] >  REGIME_MOVE_PCT]
+    falling = [r for r in rows if r["pct_change"] < -REGIME_MOVE_PCT]
+
+    rise_frac = len(rising)  / total
+    fall_frac = len(falling) / total
+
+    if fall_frac >= REGIME_CHANGE_THRESHOLD:
+        avg_drop = sum(r["pct_change"] for r in falling) / len(falling)
+        worst    = min(falling, key=lambda r: r["pct_change"])
         return (
-            f"🚨 SYSTEMIC EVENT: {len(rows)} items crashed simultaneously "
-            f"(worst: {names[0]} {worst:.1%}). Likely macro cause — "
-            f"world border, reset, or mass liquidation. Top affected: {', '.join(names)}"
+            f"⚡ REGIME CHANGE DETECTED: {len(falling)}/{total} items fell "
+            f">10% simultaneously (avg {avg_drop:.1%}, worst: "
+            f"{worst['item_id']} {worst['pct_change']:.1%}). "
+            f"Likely world border expansion or mass liquidation. "
+            f"Calibration reset — recalibrating from new baseline."
+        )
+    elif rise_frac >= REGIME_CHANGE_THRESHOLD:
+        avg_rise = sum(r["pct_change"] for r in rising) / len(rising)
+        best     = max(rising, key=lambda r: r["pct_change"])
+        return (
+            f"⚡ REGIME CHANGE DETECTED: {len(rising)}/{total} items rose "
+            f">10% simultaneously (avg +{avg_rise:.1%}, leader: "
+            f"{best['item_id']} +{best['pct_change']:.1%}). "
+            f"Possible new content drop or economy injection. "
+            f"Calibration reset — recalibrating from new baseline."
         )
     return None
 
 
 # ---------------------------------------------------------------------------
-# Top movers (outside watch list)
-# Surfaces items with the biggest price moves that you might not be watching.
+# Market breadth
+# ---------------------------------------------------------------------------
+
+def market_breadth() -> str | None:
+    if not _require_scans(MACRO_MIN_SCANS):
+        return None
+
+    with _connect() as conn:
+        scan_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM scans ORDER BY id DESC LIMIT 3"
+        ).fetchall()]
+
+    if len(scan_ids) < 3:
+        return None
+
+    newest, _, oldest = scan_ids[0], scan_ids[1], scan_ids[2]
+
+    with _connect() as conn:
+        rows = conn.execute("""
+            SELECT a.item_id,
+                   a.bbp AS bbp_new,
+                   b.bbp AS bbp_old
+            FROM snapshots a
+            JOIN snapshots b
+              ON a.item_id = b.item_id AND b.scan_id = ?
+            WHERE a.scan_id = ?
+              AND a.bbp IS NOT NULL AND b.bbp IS NOT NULL
+        """, (oldest, newest)).fetchall()
+
+    if not rows:
+        return None
+
+    rising  = sum(1 for r in rows if r["bbp_new"] > r["bbp_old"] * 1.01)
+    falling = sum(1 for r in rows if r["bbp_new"] < r["bbp_old"] * 0.99)
+    total   = len(rows)
+    pct_up  = rising / total
+
+    if pct_up > 0.65:
+        return (
+            f"📈 BULL MARKET: {rising}/{total} items rising "
+            f"({pct_up:.0%} breadth) — economy heating up"
+        )
+    elif pct_up < 0.35:
+        return (
+            f"📉 BEAR MARKET: {falling}/{total} items falling "
+            f"({1-pct_up:.0%} breadth) — economy cooling down"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Top movers outside watch list
 # ---------------------------------------------------------------------------
 
 def top_movers(watch_items: list) -> list[str]:
@@ -156,9 +175,9 @@ def top_movers(watch_items: list) -> list[str]:
     with _connect() as conn:
         rows = conn.execute("""
             SELECT a.item_id,
-                   a.bbp              AS bbp_new,
-                   b.bbp              AS bbp_old,
-                   (a.bbp - b.bbp) / b.bbp AS pct_change
+                   a.bbp                    AS bbp_new,
+                   b.bbp                    AS bbp_old,
+                   (a.bbp - b.bbp) / b.bbp  AS pct_change
             FROM snapshots a
             JOIN snapshots b
               ON a.item_id = b.item_id AND b.scan_id = ?
@@ -170,7 +189,6 @@ def top_movers(watch_items: list) -> list[str]:
             LIMIT ?
         """, (previous, newest, TOP_MOVERS_N * 3)).fetchall()
 
-    # Exclude items already on watch list
     outside = [r for r in rows if r["item_id"] not in watch_items][:TOP_MOVERS_N]
 
     alerts = []
@@ -185,28 +203,34 @@ def top_movers(watch_items: list) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Market summary — call this once per scan cycle
+# Main entry point
 # ---------------------------------------------------------------------------
 
 def analyze_macro(watch_items: list) -> list[str]:
+    # Import here to avoid circular import
+    from tracker import reset_calibration
+
     alerts = []
     scan_count = get_scan_count()
 
     if scan_count < MACRO_MIN_SCANS:
         alerts.append(
-            f"🌐 MACRO: Calibrating — {scan_count}/{MACRO_MIN_SCANS} scans collected. "
-            f"Macro signals unlock after {MACRO_MIN_SCANS - scan_count} more scans "
-            f"(~{(MACRO_MIN_SCANS - scan_count) * 0.5:.0f} hours)."
+            f"🌐 MACRO: Calibrating — {scan_count}/{MACRO_MIN_SCANS} scans. "
+            f"Macro signals unlock in ~{(MACRO_MIN_SCANS - scan_count) * 0.5:.0f} hours."
         )
+        return alerts
+
+    # Regime change check runs first — highest priority signal
+    regime = detect_regime_change()
+    if regime:
+        alerts.append(regime)
+        reset_calibration(regime)
+        # Don't run other signals this cycle — data just changed fundamentally
         return alerts
 
     breadth = market_breadth()
     if breadth:
         alerts.append(breadth)
-
-    crash = correlated_crash()
-    if crash:
-        alerts.append(crash)
 
     movers = top_movers(watch_items)
     alerts.extend(movers)

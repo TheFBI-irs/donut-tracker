@@ -1,9 +1,15 @@
 """
-tracker.py — Watch-list alerts with self-calibrating demand pressure.
+tracker.py — Watch-list alerts with rolling self-calibrating demand.
 
-Demand pressure is relative to each item's own historical baseline,
-not fixed global thresholds. The system learns what "normal" looks like
-per item and signals deviations from that — no assumptions required.
+REGIME AWARENESS:
+  Calibration uses only the last CALIBRATION_WINDOW scans, not all history.
+  This means:
+    - Normal drift: system adapts gradually over ~12 hours
+    - World border / structural break: macro.py sets a REGIME_CHANGE flag
+      in price_history, causing all baselines to reset immediately
+    - After reset: system recalibrates from the new post-event reality
+
+  This prevents pre-event data from poisoning post-event signals.
 """
 
 import json
@@ -14,11 +20,12 @@ from config import WATCH_ITEMS
 
 logger = logging.getLogger(__name__)
 
-TOP_N_BIDS       = 10
-MIN_BID_FLOOR    = 1000
-HISTORY_FILE     = "price_history.json"
-MAX_HISTORY      = 48       # ~24 hours at 30-min intervals
-CALIBRATION_MIN  = 10       # scans needed before demand labels mean anything
+TOP_N_BIDS           = 10
+MIN_BID_FLOOR        = 1000
+HISTORY_FILE         = "price_history.json"
+MAX_HISTORY          = 96       # keep up to 48 hours of raw samples
+CALIBRATION_WINDOW   = 48       # only use last 48 scans (~24hrs) for baselines
+CALIBRATION_MIN      = 10       # scans needed before labels mean anything
 VOLATILITY_THRESHOLD = 0.05
 
 FAIR_VALUES = {
@@ -30,7 +37,7 @@ FAIR_VALUES = {
 }
 
 # ---------------------------------------------------------------------------
-# Persistent history (JSON, watch-list items only)
+# Persistent history
 # ---------------------------------------------------------------------------
 
 def load_history() -> dict:
@@ -53,6 +60,26 @@ def save_history(history: dict):
 
 price_history: dict = load_history()
 
+
+def reset_calibration(reason: str):
+    """
+    Called by macro.py when a regime change is detected.
+    Wipes all per-item calibration history so the system starts fresh
+    from the new post-event baseline.
+    Raw history is preserved for the historian — only the in-memory
+    rolling window used for signals is cleared.
+    """
+    global price_history
+    logger.warning(f"Calibration reset triggered: {reason}")
+    for item in price_history:
+        if isinstance(price_history[item], list):
+            price_history[item] = []
+    price_history["_regime_reset"] = {
+        "ts": datetime.utcnow().isoformat(),
+        "reason": reason
+    }
+    save_history(price_history)
+
 # ---------------------------------------------------------------------------
 # Core metrics
 # ---------------------------------------------------------------------------
@@ -72,24 +99,26 @@ def compute_gap_pct(top_bids: list) -> float | None:
     return (sum(gaps) / len(gaps)) / top_bids[0]
 
 # ---------------------------------------------------------------------------
-# Self-calibrating demand label
-# Compares current gap% to item's own historical baseline.
-# No fixed thresholds — the item defines its own "normal."
+# Self-calibrating demand — rolling window only
+# Uses z-score against item's own recent baseline.
+# Window expires old data so post-regime signals aren't poisoned.
 # ---------------------------------------------------------------------------
 
 def describe_demand(item: str, gap_pct: float) -> str:
     records = price_history.get(item, [])
-    historical_gaps = [r["gap_pct"] for r in records if r.get("gap_pct") is not None]
 
-    n = len(historical_gaps)
+    # Use only the most recent CALIBRATION_WINDOW samples
+    window = [r["gap_pct"] for r in records[-CALIBRATION_WINDOW:]
+              if r.get("gap_pct") is not None]
+
+    n = len(window)
     if n < CALIBRATION_MIN:
         return f"📊 CALIBRATING ({n}/{CALIBRATION_MIN} scans, gap {gap_pct*100:.2f}%)"
 
-    avg  = sum(historical_gaps) / n
-    variance = sum((g - avg) ** 2 for g in historical_gaps) / n
-    std  = variance ** 0.5
+    avg = sum(window) / n
+    variance = sum((g - avg) ** 2 for g in window) / n
+    std = variance ** 0.5
 
-    # z-score: how many standard deviations from item's own mean?
     z = (gap_pct - avg) / std if std > 0 else 0
 
     if z < -1.5:
@@ -100,20 +129,19 @@ def describe_demand(item: str, gap_pct: float) -> str:
         return f"🟡 MEDIUM (gap {gap_pct*100:.2f}% vs baseline {avg*100:.2f}%)"
 
 # ---------------------------------------------------------------------------
-# Signal detectors
+# Signal detectors — all use rolling window, not full history
 # ---------------------------------------------------------------------------
 
 def detect_demand_shift(item: str) -> str | None:
     records = price_history.get(item, [])
-    gaps = [r["gap_pct"] for r in records if r.get("gap_pct") is not None]
+    gaps = [r["gap_pct"] for r in records[-CALIBRATION_WINDOW:]
+            if r.get("gap_pct") is not None]
     if len(gaps) < 4:
         return None
-
     prev_avg = sum(gaps[-4:-1]) / 3
     curr = gaps[-1]
     if prev_avg == 0:
         return None
-
     change = (curr - prev_avg) / prev_avg
     if change > 0.50:
         return f"📉 DEMAND WEAKENING: **{item}** — bid gaps widened {change:.0%} vs recent avg"
@@ -124,7 +152,8 @@ def detect_demand_shift(item: str) -> str | None:
 
 def detect_volatility(item: str) -> str | None:
     records = price_history.get(item, [])
-    prices = [r["bbp"] for r in records if r.get("bbp")]
+    prices = [r["bbp"] for r in records[-CALIBRATION_WINDOW:]
+              if r.get("bbp")]
     if len(prices) < 2:
         return None
     prev, curr = prices[-2], prices[-1]
@@ -142,7 +171,8 @@ def detect_volatility(item: str) -> str | None:
 
 def detect_trend(item: str) -> str | None:
     records = price_history.get(item, [])
-    prices = [r["bbp"] for r in records if r.get("bbp")]
+    prices = [r["bbp"] for r in records[-CALIBRATION_WINDOW:]
+              if r.get("bbp")]
     if len(prices) < 10:
         return None
     short_ma = sum(prices[-3:]) / 3
@@ -163,10 +193,9 @@ def detect_trend(item: str) -> str | None:
 
 def detect_crash_risk(item: str, bbp: float, gap_pct: float) -> str | None:
     records = price_history.get(item, [])
-    if len(records) < 3:
-        return None
-    recent_prices = [r["bbp"]     for r in records[-3:] if r.get("bbp")]
-    recent_gaps   = [r["gap_pct"] for r in records[-3:] if r.get("gap_pct") is not None]
+    recent = records[-3:]
+    recent_prices = [r["bbp"]     for r in recent if r.get("bbp")]
+    recent_gaps   = [r["gap_pct"] for r in recent if r.get("gap_pct") is not None]
     if not recent_prices or not recent_gaps:
         return None
     avg_price = sum(recent_prices) / len(recent_prices)
@@ -184,8 +213,17 @@ def detect_crash_risk(item: str, bbp: float, gap_pct: float) -> str | None:
 
 def analyze_market(orders: list) -> list:
     alerts = []
-    item_bids = {}
 
+    # Warn if a regime reset happened recently
+    reset_info = price_history.get("_regime_reset")
+    if reset_info:
+        alerts.append(
+            f"⚡ REGIME RESET: Calibration wiped at {reset_info['ts']} "
+            f"— reason: {reset_info['reason']}. "
+            f"Recalibrating from new baseline."
+        )
+
+    item_bids = {}
     for order in orders:
         item = order["item"]["itemId"]
         if item not in WATCH_ITEMS:
@@ -198,9 +236,9 @@ def analyze_market(orders: list) -> list:
     now = datetime.utcnow().isoformat()
 
     for item in WATCH_ITEMS:
-        bids      = item_bids.get(item, [])
-        top_bids  = compute_top_bids(bids)
-        bbp       = compute_bbp(top_bids)
+        bids     = item_bids.get(item, [])
+        top_bids = compute_top_bids(bids)
+        bbp      = compute_bbp(top_bids)
 
         if bbp is None:
             alerts.append(f"❓ **{item}** — no meaningful bids this scan")
@@ -218,6 +256,10 @@ def analyze_market(orders: list) -> list:
 
         # Persist BEFORE detectors so current sample is visible to them
         records = price_history.setdefault(item, [])
+        if not isinstance(records, list):
+            records = []
+            price_history[item] = records
+
         records.append({"ts": now, "bbp": bbp, "gap_pct": gap_pct, "top_bids": top_bids})
         if len(records) > MAX_HISTORY:
             records.pop(0)
