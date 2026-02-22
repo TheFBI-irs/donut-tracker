@@ -1,15 +1,9 @@
 """
-app.py — Main loop.
+app.py — Main loop + Discord bot thread.
 
-Each cycle:
-  1. Load watch list + fair values from watchlist.json (dynamic, no redeploy)
-  2. Fetch all orders from API
-  3. historian.record_scan()  → writes every item to SQLite
-  4. tracker.analyze_market() → watch-list alerts, self-calibrating demand
-  5. positions.report()       → P&L on your open positions
-  6. macro.analyze_macro()    → economy-wide signals
-  7. digest (Sundays only)    → weekly summary from historian DB
-  8. Send all alerts to Discord
+Two things run simultaneously:
+  1. Background Discord bot (bot.py) — handles on-demand !commands
+  2. Main scan loop — runs every 30 minutes, pushes alerts via webhook
 """
 
 import time
@@ -24,6 +18,7 @@ from historian import init_db, record_scan
 from positions import report_positions
 from digest import generate_digest
 from alerts import send_alert
+from bot import start_bot_thread
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,11 +34,10 @@ _last_digest_week: int | None = None
 
 
 def should_send_digest() -> bool:
-    """Send digest once per week on Sunday."""
     global _last_digest_week
     now  = datetime.now(timezone.utc)
     week = now.isocalendar()[1]
-    if now.weekday() == 6 and week != _last_digest_week:  # 6 = Sunday
+    if now.weekday() == 6 and week != _last_digest_week:
         _last_digest_week = week
         return True
     return False
@@ -52,7 +46,6 @@ def should_send_digest() -> bool:
 def run_cycle():
     logger.info("Starting market scan cycle...")
 
-    # Reload watch list every cycle — picks up edits without redeployment
     watch_items, fair_values = load_watchlist()
     if not watch_items:
         logger.warning("Watch list is empty — check watchlist.json")
@@ -62,35 +55,24 @@ def run_cycle():
         logger.warning("No orders returned — skipping cycle.")
         return
 
-    # Layer 1: record everything to SQLite
     record_scan(orders)
 
-    # Layer 2: watch-list signals
     watch_alerts = analyze_market(orders, watch_items, fair_values)
 
-    # Layer 3: current BBP map for position P&L
-    current_prices = {}
-    for alert in watch_alerts:
-        pass  # BBP is already computed inside tracker; extract from history
-    # Pull BBP directly from the most recent history records
     from tracker import price_history
+    current_prices = {}
     for item in watch_items:
         records = price_history.get(item, [])
         if records and isinstance(records, list) and records[-1].get("bbp"):
             current_prices[item] = records[-1]["bbp"]
 
     position_alerts = report_positions(current_prices)
+    macro_alerts    = analyze_macro(watch_items)
+    all_alerts      = watch_alerts + position_alerts + macro_alerts
 
-    # Layer 4: macro signals
-    macro_alerts = analyze_macro(watch_items)
-
-    all_alerts = watch_alerts + position_alerts + macro_alerts
-
-    # Layer 5: weekly digest (Sundays)
     if should_send_digest():
         logger.info("Generating weekly digest...")
-        digest_messages = generate_digest(watch_items)
-        all_alerts.extend(digest_messages)
+        all_alerts.extend(generate_digest(watch_items))
 
     for alert in all_alerts:
         send_alert(alert)
@@ -101,6 +83,9 @@ def run_cycle():
 def main():
     logger.info("Donut Market Tracker Started")
     init_db()
+
+    # Start interactive Discord bot in background thread
+    start_bot_thread()
 
     while True:
         try:
