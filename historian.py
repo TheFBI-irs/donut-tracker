@@ -34,6 +34,11 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS scans (
+                id  SERIAL PRIMARY KEY,
+                ts  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scans (
                     id  SERIAL PRIMARY KEY,
                     ts  TEXT NOT NULL
                 );

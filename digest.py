@@ -14,8 +14,7 @@ DIGEST_MIN_SCANS = 10
 
 def _scans_last_n_days(days: int) -> list[int]:
     rows = execute_query(
-        "SELECT id FROM scans WHERE ts >= NOW() - INTERVAL '%s days' ORDER BY id ASC",
-        (days,)
+        f"SELECT id FROM scans WHERE ts::timestamptz >= NOW() - INTERVAL '{int(days)} days' ORDER BY id ASC"
     )
     return [r["id"] for r in rows]
 
