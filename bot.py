@@ -49,7 +49,10 @@ def get_latest_bbp(item_id: str) -> dict | None:
     """Pull most recent snapshot for an item from PostgreSQL."""
     rows = execute_query("""
         SELECT sn.bbp, sn.gap_pct, sn.depth, sn.top_bid,
-               sn.second_bid, sn.third_bid, s.ts
+               sn.second_bid, sn.third_bid, s.ts,
+               sn.whale_hhi, sn.top_bidder, sn.avg_order_age_hours,
+               sn.tte_pressure, sn.implied_volume,
+               sn.cancel_count, sn.fill_count, sn.requote_count
         FROM snapshots sn
         JOIN scans s ON s.id = sn.scan_id
         WHERE sn.item_id = %s
@@ -84,8 +87,11 @@ async def help_cmd(ctx):
         "`!positions` — current P&L on open positions\n"
         "`!top_movers` — biggest price moves since last scan\n"
         "`!macro` — latest macro economy signals\n"
-        "`!depth <item>` — order book depth breakdown\n"
-        "`!scans` — how many scans have been recorded\n"
+        "`!depth <item>` — order book depth history\n"
+        "`!scans` — how many scans recorded\n"
+        "`!event <type> [severity] <desc>` — log a market event\n"
+        "`!events` — show recent logged events\n"
+        "`!training` — ML training data status\n"
     )
     await ctx.send(msg)
 
@@ -114,11 +120,30 @@ async def price_cmd(ctx, *, item_id: str = None):
     top_bids = [data["top_bid"], data["second_bid"], data["third_bid"]]
     top_str  = ", ".join(fmt(b) for b in top_bids if b)
 
+    hhi        = data.get("whale_hhi")
+    top_bidder = data.get("top_bidder")
+    tte        = data.get("tte_pressure")
+    avg_age    = data.get("avg_order_age_hours")
+    impl_vol   = data.get("implied_volume") or 0
+    fills      = data.get("fill_count") or 0
+    cancels    = data.get("cancel_count") or 0
+    requotes   = data.get("requote_count") or 0
+
+    hhi_label = ("🐋 CONCENTRATED" if hhi and hhi > 0.5
+                 else "✅ DISTRIBUTED" if hhi and hhi < 0.2
+                 else "🟡 MIXED") if hhi is not None else "?"
+    hhi_str   = f"{hhi:.2f}" if hhi is not None else "?"
+    tte_str   = f"{tte*100:.0f}% expiring <24h" if tte is not None else "?"
+    age_str   = f"{avg_age:.1f}h" if avg_age is not None else "?"
+
     msg = (
         f"📊 **{item_id}**\n"
         f"BBP: **{fmt(data['bbp'])}** | Top 3: [{top_str}]\n"
         f"Demand: {demand_lbl}\n"
         f"Depth: {depth_lbl}\n"
+        f"Whale: {hhi_label} (HHI {hhi_str}) | Top bidder: {top_bidder or '?'}\n"
+        f"Avg order age: {age_str} | TTE pressure: {tte_str}\n"
+        f"Volume filled: {fmt(impl_vol)} | Fills: {fills} | Cancels: {cancels} | Requotes: {requotes}\n"
         f"Last updated: {data['ts']}"
     )
     await ctx.send(msg)
@@ -279,6 +304,75 @@ async def scans_cmd(ctx):
 # ---------------------------------------------------------------------------
 # Run bot in background thread
 # ---------------------------------------------------------------------------
+
+@bot.command(name="event")
+async def event_cmd(ctx, event_type: str = None, severity: str = "major", *, description: str = ""):
+    if not event_type:
+        await ctx.send(
+            "Usage: `!event <type> [severity] <description>`\n"
+            "Types: `border_expansion`, `shop_change`, `exploit`, `admin_action`, `content_drop`\n"
+            "Severity: `minor`, `major`, `catastrophic` (default: major)\n"
+            "Example: `!event border_expansion major Overworld expanded to 30M`"
+        )
+        return
+    valid_types = ["border_expansion", "shop_change", "exploit", "admin_action", "content_drop"]
+    valid_sevs  = ["minor", "major", "catastrophic"]
+    if event_type not in valid_types:
+        await ctx.send(f"❌ Unknown type `{event_type}`. Valid: {', '.join(valid_types)}")
+        return
+    if severity not in valid_sevs:
+        await ctx.send(f"❌ Unknown severity `{severity}`. Valid: minor, major, catastrophic")
+        return
+    try:
+        from historian import log_event
+        event_id = log_event(event_type, description or "(no description)", severity)
+        emoji = {"minor": "📝", "major": "⚠️", "catastrophic": "🚨"}[severity]
+        await ctx.send(
+            f"{emoji} **EVENT LOGGED** (id={event_id})\n"
+            f"Type: `{event_type}` | Severity: `{severity}`\n"
+            f"Description: {description or '(none)'}\n"
+            f"The ML pipeline will use this as a regime boundary."
+        )
+    except Exception as e:
+        await ctx.send(f"❌ Failed to log event: {e}")
+
+
+@bot.command(name="events")
+async def events_cmd(ctx):
+    from historian import get_recent_events
+    events = get_recent_events(5)
+    if not events:
+        await ctx.send("No events logged yet. Use `!event` to log structural market events.")
+        return
+    lines = ["**📋 Recent Events:**"]
+    for e in events:
+        emoji = {"minor": "📝", "major": "⚠️", "catastrophic": "🚨"}.get(e.get("severity"), "📝")
+        lines.append(f"  {emoji} `{e['event_type']}` [{e['severity']}] — {e.get('description', '')}\n     {e['ts']}")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="training")
+async def training_cmd(ctx):
+    from features import get_training_data_summary, get_labeled_count
+    labeled = get_labeled_count()
+    summary = get_training_data_summary()
+    weeks_to_ready = max(0, (50000 - labeled) / (150 * 336)) if labeled < 50000 else 0
+    lines = [
+        "**🤖 ML Training Data Status:**",
+        f"  Labeled examples: **{labeled:,}**",
+        f"  Unique items: {summary.get('unique_items', '?')}",
+        f"  Scans covered: {summary.get('scans_covered', '?')}",
+    ]
+    if labeled > 0:
+        lines.append(f"  Avg price move: {(summary.get('avg_abs_label') or 0)*100:.2f}%")
+    if labeled < 5000:
+        lines.append(f"\n  ⏳ Building baseline... ({5000-labeled:,} more examples to first test model)")
+    elif labeled < 50000:
+        lines.append(f"\n  📈 Accumulating... (~{weeks_to_ready:.1f} weeks to 50k threshold)")
+    else:
+        lines.append("\n  ✅ **Training-ready.** Enough data to build the model.")
+    await ctx.send("\n".join(lines))
+
 
 def run_bot():
     token = os.getenv("DISCORD_BOT_TOKEN")
