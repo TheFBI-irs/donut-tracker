@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_URL          = "https://api.donut.auction/orders"
+API_URL          = "https://api.donutsmp.net/v1/auction/list"
+DONUT_API_KEY    = os.getenv("DONUT_API_KEY")
 DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK")
 CHECK_INTERVAL   = 1800  # 30 minutes
 WATCHLIST_FILE   = "watchlist.json"
